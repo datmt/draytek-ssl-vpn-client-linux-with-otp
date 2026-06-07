@@ -4,10 +4,10 @@ Native Linux SSL VPN client for DrayTek routers. Connects to DrayTek's built-in 
 
 ## How It Works
 
-The client establishes a TLS connection to the router, performs an HTTP CONNECT handshake, then negotiates a PPP tunnel using SSTP framing. Authentication supports both PAP and MS-CHAPv2. Once the PPP session is up (LCP, authentication, IPCP), a TUN device is created and IPv4 traffic flows through the encrypted tunnel.
+The client establishes a TLS connection to the router, performs an HTTP CONNECT handshake, then negotiates a PPP tunnel using SSTP framing. Authentication supports both PAP and MS-CHAPv2. Once the PPP session is up (LCP, authentication, IPCP), a TUN device is created and IPv4 traffic flows through the encrypted tunnel. If the router has two-factor authentication enabled, an OTP/TOTP challenge is handled automatically after the tunnel comes up.
 
 ```
-TLS 1.2 → HTTP CONNECT → SSTP framing → PPP (LCP/Auth/IPCP) → IPv4 tunnel
+TLS 1.2 → HTTP CONNECT → SSTP framing → PPP (LCP/Auth/IPCP) → IPv4 tunnel → OTP/TOTP (if 2FA enabled)
 ```
 
 The protocol implementation is a shared Rust library used by all components.
@@ -186,7 +186,7 @@ Install build dependencies before building:
 ./build.sh app run
 ```
 
-Create a connection profile in the GUI, enter your router's address and credentials, and click Connect. A desktop password prompt (Polkit) will appear to authorize network operations.
+Create a connection profile in the GUI, enter your router's address and credentials, and click Connect. A desktop password prompt (Polkit) will appear to authorize network operations. If your router has two-factor authentication enabled, a dialog will prompt for the OTP/TOTP code after the tunnel comes up.
 
 **Optional**: Install the Polkit policy for a nicer auth dialog with credential caching:
 
