@@ -22,6 +22,8 @@ The project has two main applications and a shared protocol library:
 | **NetworkManager Plugin** | Integrates into NM as a VPN provider, includes system tray | You want VPN in GNOME Settings / `nmcli` / system-managed |
 | **Protocol Library** | Shared crate implementing the full VPN protocol | Used internally by all components above |
 
+![DrayTek SSL VPN Client](images/vpn1.png)
+
 ### GUI App (`standalone/`)
 
 A standalone GTK4/libadwaita application for managing VPN connections. Saves connection profiles locally and provides a log view for debugging.

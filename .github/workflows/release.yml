@@ -45,7 +45,7 @@ jobs:
         with:
           name: debian-packages
           path: |
-            target/debian/draytek-vpn_*.deb
+            target/debian/draytek-vpn-standalone_*.deb
             target/deb-nm/draytek-vpn-networkmanager_*.deb
 
   build-arch:

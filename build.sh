@@ -109,7 +109,7 @@ app_deb() {
     fi
     cargo deb -p draytek-vpn
     info "Package built:"
-    ls -lh target/debian/draytek-vpn_*.deb
+    ls -lh target/debian/draytek-vpn-standalone_*.deb
 }
 
 app_appimage() {
