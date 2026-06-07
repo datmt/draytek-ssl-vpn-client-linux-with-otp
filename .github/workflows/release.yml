@@ -1,0 +1,100 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build-debian:
+    name: Debian packages
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            libgtk-4-dev libadwaita-1-dev \
+            libssl-dev pkg-config \
+            libnm-dev libgtk-3-dev gcc
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: debian-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: debian-cargo-
+
+      - name: Build standalone app .deb
+        run: ./build.sh app deb
+
+      - name: Build NM plugin .deb
+        run: ./build.sh nm deb
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: debian-packages
+          path: |
+            target/debian/draytek-vpn_*.deb
+            target/deb-nm/draytek-vpn-networkmanager_*.deb
+
+  build-arch:
+    name: Arch package
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux:latest
+    steps:
+      - name: Install system dependencies
+        run: |
+          pacman -Syu --noconfirm
+          pacman -S --needed --noconfirm \
+            base-devel git \
+            gtk4 libadwaita openssl pkgconf \
+            rust cargo \
+            networkmanager gtk3 glib2
+
+      - uses: actions/checkout@v4
+
+      - name: Build Arch package
+        run: |
+          useradd -m builder
+          chown -R builder:builder "$GITHUB_WORKSPACE"
+          su builder -c "
+            cd $GITHUB_WORKSPACE/packaging/arch
+            HOME=/home/builder CARGO_HOME=/home/builder/.cargo makepkg -fC
+          "
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: arch-packages
+          path: packaging/arch/*.pkg.tar.zst
+
+  release:
+    name: Create release
+    needs: [build-debian, build-arch]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+          merge-multiple: true
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          generate_release_notes: true
