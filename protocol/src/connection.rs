@@ -6,7 +6,7 @@ use std::pin::Pin;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_openssl::SslStream;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::constants::CLIENT_NAME;
 
@@ -100,15 +100,28 @@ pub async fn connect(
     }
 
     let response_str = String::from_utf8_lossy(&response_buf);
-    debug!("HTTP response: {}", response_str.trim());
+    info!("HTTP response headers (full):\n{}", response_str.trim());
+
+    let all_lines: Vec<&str> = response_str.lines().collect();
 
     // Parse status code from first line
     let first_line = response_str.lines().next().unwrap_or("");
     let status_code = parse_http_status(first_line)?;
 
     if status_code != 200 {
+        let error_lines: Vec<&str> = response_str.lines().skip(1).collect();
+        warn!(
+            "HTTP CONNECT failed with status {status_code}: {first_line}. Remaining headers:\n{}",
+            error_lines.join("\n")
+        );
         bail!("HTTP CONNECT failed with status {status_code}: {first_line}");
     }
+
+    info!(
+        "HTTP CONNECT success: {} ({} header lines)",
+        first_line,
+        all_lines.len()
+    );
 
     info!("HTTP CONNECT successful, switching to binary mode");
     Ok(tls_stream)

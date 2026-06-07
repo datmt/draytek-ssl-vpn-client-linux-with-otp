@@ -42,11 +42,13 @@ struct SetupArgs {
     routes: Vec<String>,
     default_gw: Option<Ipv4Addr>,
     dns: Option<Ipv4Addr>,
+    vpn_server: Option<Ipv4Addr>,
 }
 
 struct TeardownArgs {
     device: String,
     restore_dns: bool,
+    vpn_server: Option<Ipv4Addr>,
 }
 
 fn parse_setup_args(args: &[String]) -> Result<SetupArgs, Box<dyn std::error::Error>> {
@@ -58,6 +60,7 @@ fn parse_setup_args(args: &[String]) -> Result<SetupArgs, Box<dyn std::error::Er
     let mut routes = Vec::new();
     let mut default_gw = None;
     let mut dns = None;
+    let mut vpn_server = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -118,6 +121,14 @@ fn parse_setup_args(args: &[String]) -> Result<SetupArgs, Box<dyn std::error::Er
                         .parse::<Ipv4Addr>()?,
                 );
             }
+            "--vpn-server" => {
+                i += 1;
+                vpn_server = Some(
+                    args.get(i)
+                        .ok_or("--vpn-server requires a value")?
+                        .parse::<Ipv4Addr>()?,
+                );
+            }
             other => return Err(format!("Unknown option: {other}").into()),
         }
         i += 1;
@@ -132,12 +143,14 @@ fn parse_setup_args(args: &[String]) -> Result<SetupArgs, Box<dyn std::error::Er
         routes,
         default_gw,
         dns,
+        vpn_server,
     })
 }
 
 fn parse_teardown_args(args: &[String]) -> Result<TeardownArgs, Box<dyn std::error::Error>> {
     let mut device = None;
     let mut restore_dns = false;
+    let mut vpn_server = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -149,6 +162,14 @@ fn parse_teardown_args(args: &[String]) -> Result<TeardownArgs, Box<dyn std::err
             "--restore-dns" => {
                 restore_dns = true;
             }
+            "--vpn-server" => {
+                i += 1;
+                vpn_server = Some(
+                    args.get(i)
+                        .ok_or("--vpn-server requires a value")?
+                        .parse::<Ipv4Addr>()?,
+                );
+            }
             other => return Err(format!("Unknown option: {other}").into()),
         }
         i += 1;
@@ -157,6 +178,7 @@ fn parse_teardown_args(args: &[String]) -> Result<TeardownArgs, Box<dyn std::err
     Ok(TeardownArgs {
         device: device.ok_or("--device is required")?,
         restore_dns,
+        vpn_server,
     })
 }
 
@@ -200,6 +222,26 @@ fn validate_cidr(cidr: &str) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 // ── Command execution ─────────────────────────────────────────────────────────
+
+/// Read the current default gateway from the routing table.
+/// Returns `(gateway_ip, device_name)` for the first default route found.
+/// Used to add a host route for the VPN server before replacing the default route.
+fn read_default_gateway() -> Option<(String, String)> {
+    let output = Command::new("ip")
+        .args(["route", "show", "default"])
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    // Parse "default via X.X.X.X dev eth0 ..." — take first matching line
+    text.lines().find_map(|line| {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        let via_idx = parts.iter().position(|&p| p == "via")?;
+        let dev_idx = parts.iter().position(|&p| p == "dev")?;
+        let gw = parts.get(via_idx + 1)?.to_string();
+        let dev = parts.get(dev_idx + 1)?.to_string();
+        Some((gw, dev))
+    })
+}
 
 fn run_cmd(program: &str, args: &[&str]) -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("+ {program} {}", args.join(" "));
@@ -314,8 +356,30 @@ fn cmd_setup(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         run_cmd("ip", &["route", "add", route, "dev", &setup.device])?;
     }
 
-    // 5. Default gateway
+    // 5. Default gateway — add a host route for the VPN server via the original
+    //    gateway first, so the TLS tunnel connection survives the default route change.
     if let Some(gw) = setup.default_gw {
+        if let Some(server) = setup.vpn_server {
+            if let Some((orig_gw, orig_dev)) = read_default_gateway() {
+                let server_host = format!("{server}/32");
+                if let Err(e) = run_cmd(
+                    "ip",
+                    &[
+                        "route",
+                        "add",
+                        &server_host,
+                        "via",
+                        &orig_gw,
+                        "dev",
+                        &orig_dev,
+                    ],
+                ) {
+                    eprintln!("Warning: failed to add VPN server host route: {e}");
+                }
+            } else {
+                eprintln!("Warning: no default gateway found; VPN server host route not added");
+            }
+        }
         let gw_str = gw.to_string();
         run_cmd(
             "ip",
@@ -387,6 +451,14 @@ fn cmd_teardown(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     // 1. Flush routes (best-effort)
     if let Err(e) = run_cmd("ip", &["route", "flush", "dev", &teardown.device]) {
         eprintln!("Warning: failed to flush routes: {e}");
+    }
+
+    // Remove VPN server host route added during setup (best-effort)
+    if let Some(server) = teardown.vpn_server {
+        let server_host = format!("{server}/32");
+        if let Err(e) = run_cmd("ip", &["route", "del", &server_host]) {
+            eprintln!("Warning: failed to remove VPN server host route: {e}");
+        }
     }
 
     // 2. Bring down interface (best-effort)

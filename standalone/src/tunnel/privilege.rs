@@ -128,6 +128,16 @@ async fn run_helper(args: Vec<String>) -> Result<std::process::Output> {
     }
 }
 
+/// Routing and DNS options for tunnel setup.
+pub struct TunnelSetupConfig {
+    pub routes: Vec<String>,
+    pub default_gw: Option<Ipv4Addr>,
+    pub dns: Option<Ipv4Addr>,
+    /// Physical VPN server IP — used to pin a host route via the original gateway
+    /// before we replace the default route, so the TLS connection survives.
+    pub vpn_server: Option<Ipv4Addr>,
+}
+
 /// Set up the TUN device, routing, and DNS via the privileged helper.
 ///
 /// If the helper has CAP_NET_ADMIN, runs directly. Otherwise uses pkexec.
@@ -136,9 +146,7 @@ pub async fn setup(
     local_ip: Ipv4Addr,
     peer_ip: Ipv4Addr,
     mtu: u16,
-    routes: &[String],
-    default_gw: Option<Ipv4Addr>,
-    dns: Option<Ipv4Addr>,
+    cfg: &TunnelSetupConfig,
 ) -> Result<()> {
     let helper = find_helper()?;
     let uid = current_uid();
@@ -164,19 +172,28 @@ pub async fn setup(
         mtu.to_string(),
     ];
 
-    for route in routes {
+    for route in &cfg.routes {
         args.push("--route".to_string());
         args.push(route.clone());
     }
 
-    if let Some(gw) = default_gw {
+    if let Some(gw) = cfg.default_gw {
         args.push("--default-gw".to_string());
         args.push(gw.to_string());
     }
 
-    if let Some(dns_ip) = dns {
+    if let Some(dns_ip) = cfg.dns {
         args.push("--dns".to_string());
         args.push(dns_ip.to_string());
+    }
+
+    // Pass VPN server IP only when setting a default gateway — helper uses it
+    // to add a host route so the TLS tunnel survives the default route change.
+    if cfg.default_gw.is_some() {
+        if let Some(server) = cfg.vpn_server {
+            args.push("--vpn-server".to_string());
+            args.push(server.to_string());
+        }
     }
 
     let output = run_helper(args).await?;
@@ -200,7 +217,7 @@ pub async fn setup(
 ///
 /// Best-effort: logs warnings on failure rather than returning errors,
 /// since teardown should not prevent the app from continuing.
-pub async fn teardown(device: &str, restore_dns: bool) {
+pub async fn teardown(device: &str, restore_dns: bool, vpn_server: Option<Ipv4Addr>) {
     let helper = match find_helper() {
         Ok(h) => h,
         Err(e) => {
@@ -224,6 +241,11 @@ pub async fn teardown(device: &str, restore_dns: bool) {
 
     if restore_dns {
         args.push("--restore-dns".to_string());
+    }
+
+    if let Some(server) = vpn_server {
+        args.push("--vpn-server".to_string());
+        args.push(server.to_string());
     }
 
     match run_helper(args).await {

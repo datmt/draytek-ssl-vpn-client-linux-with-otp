@@ -1,3 +1,4 @@
 pub mod engine;
+pub mod otp;
 pub mod privilege;
 pub mod tun_device;

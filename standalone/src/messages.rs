@@ -48,6 +48,12 @@ pub enum TunnelStatus {
         max_packet_tx: usize,
         max_packet_rx: usize,
     },
+    /// Router requires 2FA (TOTP/OTP via vpnmfa.cgi). `ifno` identifies the VPN interface.
+    OtpRequired { ifno: u32 },
+    /// OTP code accepted by the router.
+    OtpVerified,
+    /// OTP code rejected by the router.
+    OtpFailed,
 }
 
 /// Commands from the UI to the tunnel.
@@ -57,4 +63,8 @@ pub enum TunnelCommand {
     Disconnect,
     /// Toggle data-plane keepalive pings (ICMP echo to gateway).
     ToggleKeepalive(bool),
+    /// Submit OTP code for 2FA verification (spaces are stripped automatically).
+    SubmitOtp(String),
+    /// Cancel the OTP dialog — tunnel stays up, 2FA is skipped.
+    CancelOtp,
 }

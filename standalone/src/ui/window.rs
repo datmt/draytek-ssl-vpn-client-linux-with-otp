@@ -15,6 +15,52 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use tracing::{error, info};
 
+/// Show the 2FA OTP dialog. Sends SubmitOtp or CancelOtp via the tunnel command channel.
+fn show_otp_dialog(
+    window: &adw::ApplicationWindow,
+    ifno: u32,
+    tunnel_cmd_tx: &Rc<RefCell<Option<mpsc::UnboundedSender<TunnelCommand>>>>,
+) {
+    let dialog = adw::AlertDialog::builder()
+        .heading("2-Step Verification")
+        .body(format!(
+            "The router requires a verification code (OTP/TOTP) for VPN interface {ifno}.\n\
+             Enter the code from your authenticator app, email, or SMS."
+        ))
+        .build();
+
+    let entry = gtk4::Entry::builder()
+        .placeholder_text("e.g. 123 456")
+        .max_length(7)
+        .input_purpose(gtk4::InputPurpose::Digits)
+        .activates_default(true)
+        .build();
+
+    dialog.set_extra_child(Some(&entry));
+    dialog.add_response("skip", "Skip");
+    dialog.add_response("verify", "Verify");
+    dialog.set_response_appearance("verify", adw::ResponseAppearance::Suggested);
+    dialog.set_default_response(Some("verify"));
+    dialog.set_close_response("skip");
+
+    let cmd_tx = tunnel_cmd_tx.borrow().clone();
+    let entry_clone = entry.clone();
+    dialog.connect_response(None, move |_, response| {
+        if let Some(tx) = &cmd_tx {
+            let cmd = if response == "verify" {
+                TunnelCommand::SubmitOtp(entry_clone.text().to_string())
+            } else {
+                TunnelCommand::CancelOtp
+            };
+            if let Err(e) = tx.send(cmd) {
+                error!("Failed to send OTP command: {e}");
+            }
+        }
+    });
+
+    dialog.present(Some(window));
+}
+
 pub struct MainWindow {
     pub window: adw::ApplicationWindow,
 }
@@ -295,6 +341,8 @@ impl MainWindow {
             let log_view = log_view.clone();
             let status_queue = status_queue.clone();
             let profile_keepalive = profile_keepalive.clone();
+            let window_for_otp = window.clone();
+            let tunnel_cmd_tx_for_otp = tunnel_cmd_tx.clone();
             gtk4::glib::timeout_add_local(std::time::Duration::from_millis(100), move || {
                 // Drain status updates
                 let statuses: Vec<TunnelStatus> = {
@@ -306,6 +354,10 @@ impl MainWindow {
                     // Auto-enable keepalive if profile setting is on
                     if matches!(status, TunnelStatus::Connected { .. }) && profile_keepalive.get() {
                         connection_view.keepalive_btn.set_active(true);
+                    }
+                    // Show OTP dialog when router requests 2FA
+                    if let TunnelStatus::OtpRequired { ifno } = status {
+                        show_otp_dialog(&window_for_otp, *ifno, &tunnel_cmd_tx_for_otp);
                     }
                 }
 
@@ -364,7 +416,7 @@ impl MainWindow {
                         info!("User chose to clean up stale tunnel");
                         let device = privilege::TUN_DEVICE_NAME.to_string();
                         handle.spawn(async move {
-                            privilege::teardown(&device, restore_dns).await;
+                            privilege::teardown(&device, restore_dns, None).await;
                         });
                     } else {
                         info!("User chose to ignore stale tunnel");

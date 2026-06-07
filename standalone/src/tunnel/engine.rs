@@ -2,9 +2,10 @@
 ///
 /// Manages the full lifecycle: TLS connect → HTTP CONNECT → LCP → Auth → IPCP → data loop.
 use anyhow::{bail, Context, Result};
+use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::mpsc;
-use tracing::{debug, error, info, warn};
+use tokio::sync::{mpsc, oneshot};
+use tracing::{debug, error, info, trace, warn};
 
 use draytek_vpn_protocol::connection;
 use draytek_vpn_protocol::constants::*;
@@ -20,11 +21,18 @@ use draytek_vpn_protocol::protocol::sstp::SstpPacket;
 
 use crate::glib_channels::GlibSender;
 use crate::messages::{ConnectionProfile, TunnelCommand, TunnelStatus};
+use crate::tunnel::otp;
 use crate::tunnel::privilege;
 use crate::tunnel::privilege::TUN_DEVICE_NAME;
 use crate::tunnel::tun_device;
 
 const READ_BUF_SIZE: usize = 2048;
+
+/// Bundles data-loop configuration that would otherwise push the arg count over the lint limit.
+struct DataLoopConfig {
+    addrs: TunnelAddrs,
+    otp_tx: Arc<Mutex<Option<oneshot::Sender<Option<String>>>>>,
+}
 
 /// Adapter implementing NegotiationStatus for the GUI app.
 struct GuiNegotiationStatus<'a> {
@@ -109,11 +117,20 @@ async fn run_inner(
     );
 
     // Phase 3: Privileged setup (TUN device, routing, DNS) via pkexec helper
-    let default_gw = if profile.default_gateway {
-        Some(neg.remote_ip)
-    } else {
-        None
-    };
+
+    // Capture VPN server IP from the established TCP socket — used to add a host
+    // route via the original gateway before we replace the default route, so the
+    // TLS tunnel connection survives the routing change.
+    let vpn_server_ip: Option<std::net::Ipv4Addr> =
+        tls_stream
+            .get_ref()
+            .peer_addr()
+            .ok()
+            .and_then(|addr| match addr.ip() {
+                std::net::IpAddr::V4(ip) => Some(ip),
+                _ => None,
+            });
+
     let has_dns = neg.dns.is_some();
 
     // Build routes: auto-route gateway's /24 subnet if enabled, plus manual routes
@@ -126,14 +143,29 @@ async fn run_inner(
     }
     routes.extend(profile.routes.iter().cloned());
 
+    let setup_cfg = privilege::TunnelSetupConfig {
+        routes,
+        default_gw: if profile.default_gateway {
+            Some(neg.remote_ip)
+        } else {
+            None
+        },
+        dns: neg.dns,
+        // Only pass server IP when replacing the default gateway so the helper
+        // can pin a host route for the TLS connection via the original gateway.
+        vpn_server: if profile.default_gateway {
+            vpn_server_ip
+        } else {
+            None
+        },
+    };
+
     privilege::setup(
         TUN_DEVICE_NAME,
         neg.local_ip,
         neg.remote_ip,
         neg.mtu,
-        &routes,
-        default_gw,
-        neg.dns,
+        &setup_cfg,
     )
     .await
     .context("Privileged tunnel setup failed")?;
@@ -143,7 +175,7 @@ async fn run_inner(
         Ok(t) => t,
         Err(e) => {
             // Teardown on failure to open
-            privilege::teardown(TUN_DEVICE_NAME, has_dns).await;
+            privilege::teardown(TUN_DEVICE_NAME, has_dns, setup_cfg.vpn_server).await;
             return Err(e.context("Failed to open TUN device after privileged setup"));
         }
     };
@@ -169,6 +201,18 @@ async fn run_inner(
     });
 
     // Phase 4: Data loop — teardown is guaranteed via the block below
+
+    // Start 2FA check in parallel with the data loop.
+    // The OTP task GETs http://gateway/ to detect vpnmfa redirect, then waits for the user's code.
+    // The data loop forwards SubmitOtp/CancelOtp commands via otp_answer_tx.
+    let (otp_answer_tx, otp_answer_rx) = oneshot::channel::<Option<String>>();
+    let otp_answer_tx = Arc::new(Mutex::new(Some(otp_answer_tx)));
+    let otp_task = tokio::spawn(otp::check_and_authenticate(
+        neg.remote_ip,
+        status_tx.clone(),
+        otp_answer_rx,
+    ));
+
     let mut fsms = PppFsmPair {
         lcp: neg.lcp_fsm,
         ipcp: neg.ipcp_fsm,
@@ -178,6 +222,10 @@ async fn run_inner(
         local_ip: neg.local_ip,
         remote_ip: neg.remote_ip,
     };
+    let cfg = DataLoopConfig {
+        addrs,
+        otp_tx: otp_answer_tx,
+    };
     let data_result = data_loop(
         &tun,
         &mut tls_stream,
@@ -185,16 +233,18 @@ async fn run_inner(
         &mut fsms,
         status_tx,
         cmd_rx,
-        addrs,
+        cfg,
     )
     .await;
+
+    otp_task.abort();
 
     // Close TUN fd before teardown — kernel rejects device deletion while fd is open
     drop(tun);
 
     // Always tear down the privileged resources
     status_tx.send(TunnelStatus::Disconnecting);
-    privilege::teardown(TUN_DEVICE_NAME, has_dns).await;
+    privilege::teardown(TUN_DEVICE_NAME, has_dns, setup_cfg.vpn_server).await;
 
     data_result
 }
@@ -207,9 +257,10 @@ async fn data_loop(
     fsms: &mut PppFsmPair,
     status_tx: &GlibSender<TunnelStatus>,
     cmd_rx: &mut mpsc::UnboundedReceiver<TunnelCommand>,
-    addrs: TunnelAddrs,
+    cfg: DataLoopConfig,
 ) -> Result<()> {
     info!("Entering data transfer loop");
+    let DataLoopConfig { addrs, otp_tx } = cfg;
     let mut keepalive = KeepaliveTracker::new();
     let mut tun_buf = vec![0u8; MAX_PACKET_SIZE + 64];
     let mut read_buf = [0u8; READ_BUF_SIZE];
@@ -248,6 +299,18 @@ async fn data_loop(
                 // Process all complete packets
                 while let Some(sstp) = SstpPacket::parse_from_buf(socket_buf)
                     .context("Failed to parse SSTP packet in data loop")? {
+                    if sstp.command == 0x00 {
+                        trace!(
+                            "DATA loop raw SSTP: CMD=DATA len={} {} bytes total",
+                            sstp.data.len(),
+                            4 + sstp.data.len()
+                        );
+                    } else {
+                        trace!(
+                            "DATA loop raw SSTP: CMD=0x{:02X} version={} len={}",
+                            sstp.command, sstp.version, sstp.data.len()
+                        );
+                    }
                     if sstp.is_close() {
                         info!("Server sent CLOSE");
                         return Ok(());
@@ -257,7 +320,7 @@ async fn data_loop(
                         continue;
                     }
                     if sstp.is_request() {
-                        continue; // Ignore server's keepalive requests
+                        continue; // Server keepalive request — ignore
                     }
                     if !sstp.is_data() {
                         warn!("Unexpected SSTP command 0x{:02X}, shutting down", sstp.command);
@@ -361,6 +424,16 @@ async fn data_loop(
                         if let Some(frame) = ping.set_enabled(enabled) {
                             send_ppp_frame(&frame, tls_stream).await
                                 .context("Failed to send keepalive ping")?;
+                        }
+                    }
+                    Some(TunnelCommand::SubmitOtp(code)) => {
+                        if let Some(tx) = otp_tx.lock().expect("otp_tx lock").take() {
+                            let _ = tx.send(Some(code));
+                        }
+                    }
+                    Some(TunnelCommand::CancelOtp) => {
+                        if let Some(tx) = otp_tx.lock().expect("otp_tx lock").take() {
+                            let _ = tx.send(None);
                         }
                     }
                 }

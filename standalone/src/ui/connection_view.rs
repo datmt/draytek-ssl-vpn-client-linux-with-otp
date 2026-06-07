@@ -341,6 +341,22 @@ impl ConnectionView {
                 self.connect_btn.set_sensitive(true);
                 self.disconnect_btn.set_visible(false);
             }
+            TunnelStatus::OtpRequired { .. } => {
+                // Dialog is shown by window.rs; update status label while waiting.
+                self.status_label.set_label("2FA Required");
+                self.details_label
+                    .set_label("Enter the verification code sent by the router");
+                self.details_label.set_visible(true);
+            }
+            TunnelStatus::OtpVerified => {
+                self.details_label.set_label("2FA verified");
+                self.details_label.set_visible(false);
+            }
+            TunnelStatus::OtpFailed => {
+                self.details_label
+                    .set_label("2FA code rejected — tunnel stays up");
+                self.details_label.set_visible(true);
+            }
             TunnelStatus::Stats {
                 bytes_tx,
                 bytes_rx,

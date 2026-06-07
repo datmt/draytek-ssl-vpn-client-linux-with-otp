@@ -4,7 +4,7 @@ use bytes::BytesMut;
 use std::net::Ipv4Addr;
 use std::pin::Pin;
 use tokio::io::AsyncReadExt;
-use tracing::{debug, info};
+use tracing::{debug, info, trace, warn};
 
 use crate::constants::*;
 use crate::engine_common::{check_shutdown, execute_actions, send_ppp_frame};
@@ -113,6 +113,20 @@ pub async fn negotiate(
 
         // Process all complete SSTP packets in the buffer
         while let Some(sstp) = SstpPacket::parse_from_buf(&mut socket_buf)? {
+            if sstp.command == 0x00 {
+                trace!(
+                    "Raw SSTP packet: CMD=DATA len={} total={} bytes",
+                    sstp.data.len(),
+                    4 + sstp.data.len()
+                );
+            } else {
+                trace!(
+                    "Raw SSTP packet: CMD=0x{:02X} version={} len={}",
+                    sstp.command,
+                    sstp.version,
+                    sstp.data.len()
+                );
+            }
             if sstp.is_close() {
                 bail!("Server sent CLOSE during negotiation");
             }
@@ -137,6 +151,31 @@ pub async fn negotiate(
                     "{}: code={}, id={}, state={:?}",
                     lcp_fsm.tag, ctrl.code, ctrl.identifier, lcp_fsm.state
                 );
+                // Verbose: dump raw LCP option bytes for every frame
+                let lcp_opts = ctrl.parse_options();
+                trace!(
+                    "LCP frame [code={} id={} state={}]: raw data={:?}",
+                    ctrl.code,
+                    ctrl.identifier,
+                    lcp_fsm.state as u8,
+                    ctrl.data
+                );
+                if let Ok(ref opts) = lcp_opts {
+                    for opt in opts {
+                        trace!(
+                            "LCP option: type=0x{:02X} ({}) len={} data={:?}",
+                            opt.option_type,
+                            match opt.option_type {
+                                1 => "MRU",
+                                3 => "AUTH_PROTO",
+                                5 => "MAGIC_NUM",
+                                _ => "UNKNOWN",
+                            },
+                            opt.data.len(),
+                            opt.data
+                        );
+                    }
+                }
                 let actions = lcp_fsm.handle_event(FsmEvent::ReceiveFrame(ctrl));
                 execute_actions(&actions, PPP_LCP, lcp_fsm.tag, tls_stream).await?;
                 check_shutdown(&actions)?;
@@ -146,14 +185,50 @@ pub async fn negotiate(
                     status.on_authenticating();
                     let auth_method = lcp::get_auth_method(&lcp_fsm);
                     info!("LCP opened, auth method: {auth_method:?}");
+                    // Verbose: dump ALL remote options that LCP negotiated so we can detect
+                    // anything we missed (e.g. OAuth2 auth that wasn't advertised in acceptable_remote
+                    // so the FSM treats it as unknown/Code-Reject)
+                    trace!("LCP negotiated_remote_options (auth basis):");
+                    for opt in &lcp_fsm.negotiated_remote_options {
+                        trace!(
+                            "  LCP remote option: type=0x{:02X} data={:?}",
+                            opt.option_type,
+                            opt.data
+                        );
+                    }
+                    // Also dump local options to see what we proposed
+                    trace!("LCP desired_local_options (what we asked for):");
+                    for opt in &lcp_fsm.desired_local_options {
+                        trace!(
+                            "  LCP local option: type=0x{:02X} data={:?}",
+                            opt.option_type,
+                            opt.data
+                        );
+                    }
+                    // Also dump acceptable_remote to see what auth methods we told the FSM we accept
+                    trace!("LCP acceptable_remote_options (auth methods we accept):");
+                    for opt in &lcp_fsm.acceptable_remote_options {
+                        if opt.option_type == PPP_LCP_CONFIG_AUTH_PROTO {
+                            trace!("  Acceptable AUTH: data={:?}", opt.data);
+                        }
+                    }
 
                     if auth_method == Some(AuthMethod::Pap) {
+                        // Auth method detected, now show what the code does next
+                        let user_preview = if profile.username.len() > 3 {
+                            format!("{}...", &profile.username[..3])
+                        } else {
+                            profile.username.clone()
+                        };
+                        trace!("Auth path: PAP with username={}", user_preview);
+
                         // Send PAP request immediately
                         let pap_data = build_pap_payload(&profile.username, &profile.password);
                         let mut pap_frame = PppControlFrame::new(PPP_PAP_REQUEST, 1);
                         pap_frame.data = pap_data;
                         let ppp_frame = PppFrame::new(PPP_PAP, pap_frame.to_bytes());
                         send_ppp_frame(&ppp_frame, tls_stream).await?;
+                        trace!("Sent PAP request frame");
                     }
                     // CHAP: wait for the server to send a challenge
                 }
@@ -187,6 +262,19 @@ pub async fn negotiate(
                     let auth_method = lcp::get_auth_method(&lcp_fsm)
                         .context("No auth method negotiated but received CHAP challenge")?;
 
+                    let user_preview = if profile.username.len() > 3 {
+                        format!("{}...", &profile.username[..3])
+                    } else {
+                        profile.username.clone()
+                    };
+                    info!(
+                        "CHAP challenge received: challenge_len={} auth_method={:?} username={}",
+                        challenge.value.len(),
+                        auth_method,
+                        user_preview
+                    );
+                    trace!("CHAP challenge raw data: {:02x?}", ctrl.data);
+
                     let response_value = auth::authenticate(
                         auth_method,
                         &profile.username,
@@ -195,11 +283,16 @@ pub async fn negotiate(
                     )
                     .context("CHAP authentication computation failed")?;
 
+                    let response_len = response_value.len();
                     let chap_payload = build_chap_response(&response_value, &profile.username);
                     let mut resp_frame = PppControlFrame::new(PPP_CHAP_RESPONSE, ctrl.identifier);
                     resp_frame.data = chap_payload;
                     let ppp_frame = PppFrame::new(PPP_CHAP, resp_frame.to_bytes());
                     send_ppp_frame(&ppp_frame, tls_stream).await?;
+                    info!(
+                        "Sent CHAP response: method={:?} response_len={} id={}",
+                        auth_method, response_len, ctrl.identifier
+                    );
                 } else if ctrl.code == PPP_CHAP_SUCCESS {
                     info!("CHAP authentication successful");
                     auth_done = true;
@@ -221,6 +314,24 @@ pub async fn negotiate(
                     "{}: code={}, id={}, state={:?}",
                     ipcp_fsm.tag, ctrl.code, ctrl.identifier, ipcp_fsm.state
                 );
+                let ipcp_opts = ctrl.parse_options();
+                trace!(
+                    "IPCP frame [code={} id={} state={}]: raw data={:?}",
+                    ctrl.code,
+                    ctrl.identifier,
+                    ipcp_fsm.state as u8,
+                    ctrl.data
+                );
+                if let Ok(ref opts) = ipcp_opts {
+                    for opt in opts {
+                        trace!(
+                            "IPCP option: type=0x{:02X} len={} data={:?}",
+                            opt.option_type,
+                            opt.data.len(),
+                            opt.data
+                        );
+                    }
+                }
 
                 // Handle the case where IPCP arrives before auth completes
                 // (router may start IPCP proactively)
@@ -240,7 +351,11 @@ pub async fn negotiate(
                 // Reject all CCP options
                 let ctrl = PppControlFrame::parse(&ppp.information)
                     .context("Failed to parse CCP control frame")?;
-                debug!("CCP: code={}, rejecting", ctrl.code);
+                warn!(
+                    "CCP: code={}, id={}; CCP (compression control) is unsupported and rejected",
+                    ctrl.code, ctrl.identifier
+                );
+                trace!("CCP raw data: {:02x?}", ctrl.data);
                 if ctrl.code == PPP_CONFIG_REQ {
                     let options = ctrl
                         .parse_options()

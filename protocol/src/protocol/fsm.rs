@@ -1,9 +1,10 @@
 /// Pure PPP negotiation FSM — no I/O, no side effects.
-///
-/// Takes events in, returns `Vec<FsmAction>` out. The tunnel engine
-/// executes the actions. Ported from PppNegotiationFsm.java.
+//
+// Takes events in, returns `Vec<FsmAction>` out. The tunnel engine
+// executes the actions. Ported from PppNegotiationFsm.java.
 use crate::constants::*;
 use crate::protocol::ppp_control::{parse_options, PppControlFrame, PppControlOption};
+use tracing::{trace, warn};
 
 /// FSM states.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -336,10 +337,22 @@ impl PppFsm {
 
     /// Evaluate a Config-Request from the peer.
     fn evaluate_config_request(&mut self, frame: &PppControlFrame) -> EvalResult {
+        trace!(
+            "{} evaluate_config_request: code={} id={} received_option_count={} state={:?}",
+            self.tag,
+            frame.code,
+            frame.identifier,
+            parse_options(&frame.data).map(|o| o.len()).unwrap_or(0),
+            self.state
+        );
         let received_options = match parse_options(&frame.data) {
             Ok(opts) => opts,
             Err(_) => {
                 // Can't parse options — reject the whole frame
+                warn!(
+                    "{} Failed to parse received options, sending Code-Reject",
+                    self.tag
+                );
                 let reject = PppControlFrame::config_reject(frame.identifier, &[]);
                 return EvalResult::NakOrReject(reject);
             }
@@ -353,6 +366,24 @@ impl PppFsm {
             }
         }
         if !reject_options.is_empty() {
+            warn!(
+                "{} Config-Reject (unrecognized options): code={} id={}",
+                self.tag, frame.code, frame.identifier
+            );
+            for opt in &reject_options {
+                warn!(
+                    "  Rejected option: type=0x{:02X} data={:?}",
+                    opt.option_type, opt.data
+                );
+            }
+            trace!(
+                "{} known option_types: {:?}",
+                self.tag,
+                self.acceptable_remote_options
+                    .iter()
+                    .map(|o| o.option_type)
+                    .collect::<Vec<_>>()
+            );
             return EvalResult::NakOrReject(PppControlFrame::config_reject(
                 frame.identifier,
                 &reject_options,
@@ -402,6 +433,13 @@ impl PppFsm {
         }
 
         // All good — send Ack
+        trace!(
+            "{} Config-Ack: code={} id={} accepted_options={}",
+            self.tag,
+            frame.code,
+            frame.identifier,
+            received_options.len()
+        );
         EvalResult::Accept(
             PppControlFrame::config_ack(frame.identifier, &received_options),
             received_options,
