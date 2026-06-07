@@ -464,12 +464,20 @@ async fn data_loop(
                         continue;
                     }
                     if !sstp.is_data() {
-                        warn!("Unexpected SSTP command 0x{:02X}", sstp.command);
-                        return Ok(());
+                        warn!("Unexpected SSTP command 0x{:02X}, ignoring", sstp.command);
+                        continue;
                     }
 
-                    let ppp = PppFrame::parse(&sstp.data)
-                        .context("Failed to parse PPP frame in data loop")?;
+                    if sstp.data.is_empty() {
+                        continue;
+                    }
+                    let ppp = match PppFrame::parse(&sstp.data) {
+                        Ok(f) => f,
+                        Err(e) => {
+                            warn!("Failed to parse PPP frame ({}), ignoring", e);
+                            continue;
+                        }
+                    };
 
                     if ppp.is_ipv4() {
                         stats.record_rx(ppp.information.len());
