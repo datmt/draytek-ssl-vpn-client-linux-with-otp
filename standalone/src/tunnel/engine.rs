@@ -78,17 +78,30 @@ pub async fn run(
     status_tx: GlibSender<TunnelStatus>,
     mut cmd_rx: mpsc::UnboundedReceiver<TunnelCommand>,
 ) {
-    if let Err(e) = run_inner(profile, &status_tx, &mut cmd_rx).await {
-        error!("Tunnel error: {e:#}");
-        status_tx.send(TunnelStatus::Error(format!("{e:#}")));
+    loop {
+        let mut user_disconnected = false;
+        match run_inner(&profile, &status_tx, &mut cmd_rx, &mut user_disconnected).await {
+            Ok(()) if user_disconnected => break,
+            Ok(()) => {
+                info!("Server closed connection, reconnecting in 5s");
+                status_tx.send(TunnelStatus::Connecting);
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            }
+            Err(e) => {
+                error!("Tunnel error: {e:#}");
+                status_tx.send(TunnelStatus::Error(format!("{e:#}")));
+                break;
+            }
+        }
     }
     status_tx.send(TunnelStatus::Disconnected);
 }
 
 async fn run_inner(
-    profile: ConnectionProfile,
+    profile: &ConnectionProfile,
     status_tx: &GlibSender<TunnelStatus>,
     cmd_rx: &mut mpsc::UnboundedReceiver<TunnelCommand>,
+    user_disconnected: &mut bool,
 ) -> Result<()> {
     // Phase 1: TLS + HTTP CONNECT
     status_tx.send(TunnelStatus::Connecting);
@@ -107,7 +120,10 @@ async fn run_inner(
     let gui_status = GuiNegotiationStatus { status_tx };
     let mut neg = match negotiate::negotiate(&profile, &mut tls_stream, &gui_status).await? {
         Some(n) => n,
-        None => return Ok(()), // user disconnected during negotiation
+        None => {
+            *user_disconnected = true;
+            return Ok(());
+        }
     };
 
     info!(
@@ -234,6 +250,7 @@ async fn run_inner(
         status_tx,
         cmd_rx,
         cfg,
+        user_disconnected,
     )
     .await;
 
@@ -258,6 +275,7 @@ async fn data_loop(
     status_tx: &GlibSender<TunnelStatus>,
     cmd_rx: &mut mpsc::UnboundedReceiver<TunnelCommand>,
     cfg: DataLoopConfig,
+    user_disconnected: &mut bool,
 ) -> Result<()> {
     info!("Entering data transfer loop");
     let DataLoopConfig { addrs, otp_tx } = cfg;
@@ -416,6 +434,7 @@ async fn data_loop(
                 match cmd {
                     Some(TunnelCommand::Disconnect) | None => {
                         info!("Disconnect requested");
+                        *user_disconnected = true;
                         status_tx.send(TunnelStatus::Disconnecting);
                         // Send LCP terminate
                         let actions = fsms.lcp.handle_event(FsmEvent::Close);
